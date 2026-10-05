@@ -1,0 +1,521 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect } from 'react';
+import {
+  Sparkles,
+  BookOpen,
+  History,
+  AlertCircle,
+  HelpCircle,
+  FileJson,
+  X,
+  Palette,
+  Film,
+  Zap,
+} from 'lucide-react';
+import { ComicStory, ViewMode, ComicPanel } from './types/comic';
+import { STORY_PRESETS } from './data/presets';
+import { INITIAL_SAMPLE_COMIC } from './data/sampleComic';
+import { StoryCreatorForm } from './components/StoryCreatorForm';
+import { ComicHeader } from './components/ComicHeader';
+import { CharactersList } from './components/CharactersList';
+import { ComicPanelCard } from './components/ComicPanelCard';
+import { ReaderMode } from './components/ReaderMode';
+import { ScriptMode } from './components/ScriptMode';
+import { PanelRevisionModal } from './components/PanelRevisionModal';
+
+const STORAGE_KEY = 'comiccraft_saved_stories_v1';
+
+export default function App() {
+  // Input Form State
+  const [storyIdea, setStoryIdea] = useState(
+    'A young student discovers a robot inside an abandoned laboratory...'
+  );
+  const [characterName, setCharacterName] = useState('Arun');
+  const [genre, setGenre] = useState('Science Fiction');
+  const [tone, setTone] = useState('Exciting');
+  const [panelCount, setPanelCount] = useState(6);
+  const [language, setLanguage] = useState('English');
+  const [artStyle, setArtStyle] = useState('Classic American Comic');
+
+  // App & Generation State
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [comic, setComic] = useState<ComicStory>(INITIAL_SAMPLE_COMIC);
+  const [viewMode, setViewMode] = useState<ViewMode>('grid');
+
+  // History / Saved Stories
+  const [savedStories, setSavedStories] = useState<ComicStory[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+
+  // Panel Revision Modal
+  const [revisionModalOpen, setRevisionModalOpen] = useState(false);
+  const [selectedPanelIndex, setSelectedPanelIndex] = useState<number>(0);
+  const [isRevising, setIsRevising] = useState(false);
+
+  // Load history from localStorage
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setSavedStories(parsed);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Save comic to history helper
+  const saveToHistory = (newComic: ComicStory) => {
+    setSavedStories((prev) => {
+      const updated = [newComic, ...prev.filter((c) => c.title !== newComic.title)].slice(0, 15);
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+      } catch {
+        // quota exceeded fallback
+      }
+      return updated;
+    });
+  };
+
+  // Generate Comic Story Handler
+  const handleGenerateComic = async () => {
+    if (!storyIdea.trim()) {
+      setErrorMessage('Please enter a story idea first.');
+      return;
+    }
+
+    setIsGenerating(true);
+    setErrorMessage(null);
+
+    try {
+      const res = await fetch('/api/comic/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          storyIdea,
+          characterName: characterName.trim() || 'Hero',
+          genre,
+          tone,
+          panelCount,
+          language,
+          artStyle,
+        }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `Server responded with status ${res.status}`);
+      }
+
+      const generatedStory: ComicStory = await res.json();
+      generatedStory.createdAt = new Date().toISOString();
+      generatedStory.id = `comic_${Date.now()}`;
+
+      setComic(generatedStory);
+      saveToHistory(generatedStory);
+
+      // Scroll smoothly down to the comic display
+      setTimeout(() => {
+        const comicSection = document.getElementById('comic-story-display');
+        if (comicSection) {
+          comicSection.scrollIntoView({ behavior: 'smooth' });
+        }
+      }, 100);
+    } catch (err: any) {
+      console.error('Comic generation error:', err);
+      setErrorMessage(
+        err.message || 'Unable to generate comic. Please check your network or try again.'
+      );
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  // Generate AI Image for a single panel
+  const handleGeneratePanelImage = async (panelNumber: number) => {
+    if (!comic) return;
+
+    // Mark panel as generating
+    setComic((prev) => {
+      const updatedPanels = prev.panels.map((p) =>
+        p.panel_number === panelNumber ? { ...p, isGeneratingImage: true } : p
+      );
+      return { ...prev, panels: updatedPanels };
+    });
+
+    const targetPanel = comic.panels.find((p) => p.panel_number === panelNumber);
+    if (!targetPanel) return;
+
+    try {
+      const res = await fetch('/api/comic/generate-image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: targetPanel.image_prompt,
+          artStyle: comic.art_style || artStyle,
+          panelNumber,
+        }),
+      });
+
+      const data = await res.json();
+      if (data.success && data.imageUrl) {
+        setComic((prev) => {
+          const updatedPanels = prev.panels.map((p) =>
+            p.panel_number === panelNumber
+              ? { ...p, generated_image: data.imageUrl, isGeneratingImage: false }
+              : p
+          );
+          const updatedStory = { ...prev, panels: updatedPanels };
+          saveToHistory(updatedStory);
+          return updatedStory;
+        });
+      } else {
+        // Stop spinner if model image was unavailable
+        setComic((prev) => {
+          const updatedPanels = prev.panels.map((p) =>
+            p.panel_number === panelNumber ? { ...p, isGeneratingImage: false } : p
+          );
+          return { ...prev, panels: updatedPanels };
+        });
+        if (data.error) {
+          console.warn('AI Image Generation notice:', data.error);
+        }
+      }
+    } catch (err) {
+      console.error('Error generating image:', err);
+      setComic((prev) => {
+        const updatedPanels = prev.panels.map((p) =>
+          p.panel_number === panelNumber ? { ...p, isGeneratingImage: false } : p
+        );
+        return { ...prev, panels: updatedPanels };
+      });
+    }
+  };
+
+  // Revise panel with Gemini
+  const handleOpenReviseModal = (panelIndex: number) => {
+    setSelectedPanelIndex(panelIndex);
+    setRevisionModalOpen(true);
+  };
+
+  const handleRevisePanel = async (instruction: string) => {
+    if (!comic) return;
+    setIsRevising(true);
+
+    try {
+      const res = await fetch('/api/comic/revise-panel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          comic,
+          panelIndex: selectedPanelIndex,
+          instruction,
+        }),
+      });
+
+      const data = await res.json();
+      if (data.success && data.panel) {
+        setComic((prev) => {
+          const updatedPanels = [...prev.panels];
+          updatedPanels[selectedPanelIndex] = {
+            ...data.panel,
+            panel_number: selectedPanelIndex + 1,
+          };
+          const updated = { ...prev, panels: updatedPanels };
+          saveToHistory(updated);
+          return updated;
+        });
+        setRevisionModalOpen(false);
+      } else {
+        throw new Error(data.error || 'Revision failed');
+      }
+    } catch (err: any) {
+      console.error('Error revising panel:', err);
+      alert(err.message || 'Could not revise panel. Please try again.');
+    } finally {
+      setIsRevising(false);
+    }
+  };
+
+  const handleResetToNew = () => {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  return (
+    <div className="min-h-screen bg-[#f7f4ea] text-slate-900 pb-20 comic-paper selection:bg-amber-300">
+      {/* Top Banner Navigation */}
+      <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b-3 border-slate-950 py-3 px-4 md:px-8 no-print">
+        <div className="max-w-6xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-amber-400 border-2 border-slate-950 flex items-center justify-center font-bangers text-2xl text-slate-950 comic-shadow-sm">
+              🎨
+            </div>
+            <div>
+              <div className="font-bangers text-2xl md:text-3xl text-slate-950 tracking-wider leading-none">
+                COMICCRAFT
+              </div>
+              <p className="text-[11px] font-sans font-medium text-slate-600 hidden sm:block">
+                AI Comic Story Creator powered by Google Gemini
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {savedStories.length > 0 && (
+              <button
+                onClick={() => setShowHistory(!showHistory)}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border-2 border-slate-900 bg-white hover:bg-slate-100 text-xs font-bold text-slate-800 comic-shadow-sm transition-all cursor-pointer"
+              >
+                <History className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Saved Stories ({savedStories.length})</span>
+              </button>
+            )}
+
+            <button
+              onClick={handleResetToNew}
+              className="flex items-center gap-1 px-3 py-1.5 rounded-lg border-2 border-slate-900 bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-bangers tracking-wider uppercase comic-shadow-sm transition-transform active:scale-95 cursor-pointer"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Create New</span>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Saved Stories Drawer / Popover */}
+      {showHistory && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex justify-end no-print">
+          <div className="w-full max-w-md bg-white h-full p-6 border-l-4 border-slate-950 flex flex-col justify-between overflow-y-auto">
+            <div>
+              <div className="flex items-center justify-between pb-3 border-b-2 border-slate-900 mb-4">
+                <div className="flex items-center gap-2">
+                  <History className="w-5 h-5 text-amber-500" />
+                  <h3 className="font-bangers text-2xl text-slate-950 tracking-wider">
+                    SAVED COMICS ({savedStories.length})
+                  </h3>
+                </div>
+                <button
+                  onClick={() => setShowHistory(false)}
+                  className="p-1 hover:bg-slate-100 rounded-full"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="space-y-3">
+                {savedStories.map((item, idx) => (
+                  <div
+                    key={idx}
+                    onClick={() => {
+                      setComic(item);
+                      setShowHistory(false);
+                      const comicSection = document.getElementById('comic-story-display');
+                      if (comicSection) comicSection.scrollIntoView({ behavior: 'smooth' });
+                    }}
+                    className="p-3.5 rounded-xl border-2 border-slate-900 bg-amber-50/50 hover:bg-amber-100 cursor-pointer transition-all comic-shadow-sm hover:-translate-y-0.5"
+                  >
+                    <div className="flex items-center justify-between text-[11px] font-bold uppercase text-slate-600 mb-1">
+                      <span>{item.genre}</span>
+                      <span>{item.panels.length} panels</span>
+                    </div>
+                    <h4 className="font-bangers text-lg text-slate-950 tracking-wide mb-1">
+                      {item.title}
+                    </h4>
+                    {item.logline && (
+                      <p className="text-xs text-slate-600 line-clamp-2 italic">
+                        "{item.logline}"
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="pt-4 border-t border-slate-200">
+              <button
+                onClick={() => {
+                  localStorage.removeItem(STORAGE_KEY);
+                  setSavedStories([]);
+                  setShowHistory(false);
+                }}
+                className="w-full text-center text-xs text-red-600 hover:underline py-2"
+              >
+                Clear Saved Stories
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Main Container */}
+      <main className="max-w-6xl mx-auto px-4 md:px-6 pt-6">
+        {/* Hero Title Section matching Streamlit app */}
+        <div className="text-center mb-8 no-print">
+          <div className="inline-block transform -rotate-1 hover:rotate-0 transition-transform">
+            <h1 className="font-bangers text-4xl sm:text-6xl md:text-7xl text-slate-950 tracking-wider drop-shadow-sm">
+              🎨 ComicCraft
+            </h1>
+          </div>
+          <p className="font-comic text-lg sm:text-xl text-slate-700 mt-2 font-semibold">
+            AI Comic Story Creator powered by Google Gemini
+          </p>
+          <div className="w-24 h-1.5 bg-amber-400 mx-auto mt-3 rounded-full border border-slate-900" />
+        </div>
+
+        {/* Story Creator Form */}
+        <div className="mb-12 no-print">
+          <StoryCreatorForm
+            storyIdea={storyIdea}
+            setStoryIdea={setStoryIdea}
+            characterName={characterName}
+            setCharacterName={setCharacterName}
+            genre={genre}
+            setGenre={setGenre}
+            tone={tone}
+            setTone={setTone}
+            panelCount={panelCount}
+            setPanelCount={setPanelCount}
+            language={language}
+            setLanguage={setLanguage}
+            artStyle={artStyle}
+            setArtStyle={setArtStyle}
+            onGenerate={handleGenerateComic}
+            isGenerating={isGenerating}
+          />
+        </div>
+
+        {/* Error Alert */}
+        {errorMessage && (
+          <div className="mb-8 p-4 bg-red-100 border-3 border-red-700 rounded-xl comic-shadow text-red-950 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-red-700 shrink-0 mt-0.5" />
+            <div className="flex-1 text-sm font-comic">
+              <strong className="font-bold font-sans">Error: </strong>
+              {errorMessage}
+            </div>
+            <button onClick={() => setErrorMessage(null)} className="text-red-700 hover:text-red-950">
+              ✕
+            </button>
+          </div>
+        )}
+
+        {/* Generated Comic Story Display */}
+        {comic && (
+          <div id="comic-story-display" className="scroll-mt-20">
+            {/* Comic Header with Title, Mode toggles, and Actions */}
+            <ComicHeader
+              comic={comic}
+              viewMode={viewMode}
+              setViewMode={setViewMode}
+              onNewComic={handleResetToNew}
+            />
+
+            {/* Characters Cast Sheet */}
+            <div className="no-print">
+              <CharactersList characters={comic.characters} />
+            </div>
+
+            {/* Panels Section Header */}
+            <div className="flex items-center justify-between mb-6 pb-2 border-b-2 border-slate-900">
+              <div className="flex items-center gap-2">
+                <span className="text-2xl">🎬</span>
+                <h3 className="font-bangers text-2xl md:text-3xl text-slate-950 tracking-wider">
+                  COMIC PANELS ({comic.panels.length})
+                </h3>
+              </div>
+              <span className="text-xs font-semibold text-slate-500 no-print">
+                Mode: {viewMode.toUpperCase()}
+              </span>
+            </div>
+
+            {/* Panels Display: Grid, Webtoon, Reader, or Script */}
+            {viewMode === 'grid' && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 md:gap-8">
+                {comic.panels.map((panel, idx) => (
+                  <ComicPanelCard
+                    key={panel.panel_number || idx}
+                    panel={panel}
+                    panelIndex={idx}
+                    genre={comic.genre}
+                    artStyle={comic.art_style}
+                    onGenerateImage={handleGeneratePanelImage}
+                    onRevisePanel={handleOpenReviseModal}
+                  />
+                ))}
+              </div>
+            )}
+
+            {viewMode === 'webtoon' && (
+              <div className="max-w-2xl mx-auto space-y-10">
+                {comic.panels.map((panel, idx) => (
+                  <ComicPanelCard
+                    key={panel.panel_number || idx}
+                    panel={panel}
+                    panelIndex={idx}
+                    genre={comic.genre}
+                    artStyle={comic.art_style}
+                    onGenerateImage={handleGeneratePanelImage}
+                    onRevisePanel={handleOpenReviseModal}
+                  />
+                ))}
+              </div>
+            )}
+
+            {viewMode === 'reader' && (
+              <ReaderMode
+                panels={comic.panels}
+                genre={comic.genre}
+                artStyle={comic.art_style}
+                onGenerateImage={handleGeneratePanelImage}
+              />
+            )}
+
+            {viewMode === 'script' && <ScriptMode comic={comic} />}
+
+            {/* Bottom Download Bar (Exactly matching Streamlit Download button) */}
+            <div className="mt-12 p-6 bg-white rounded-2xl border-3 border-slate-950 comic-shadow-lg text-center no-print">
+              <h4 className="font-bangers text-2xl text-slate-950 tracking-wider mb-2">
+                📥 EXPORT YOUR COMIC SCRIPT
+              </h4>
+              <p className="text-xs text-slate-600 mb-4 max-w-md mx-auto">
+                Download the complete comic metadata, character profiles, camera staging, panel
+                dialogues, and image generation prompts in standard JSON format.
+              </p>
+              <button
+                onClick={() => {
+                  const jsonStr = JSON.stringify(comic, null, 4);
+                  const blob = new Blob([jsonStr], { type: 'application/json' });
+                  const url = URL.createObjectURL(blob);
+                  const link = document.createElement('a');
+                  link.href = url;
+                  link.download = `${(comic.title || 'comic_story').toLowerCase().replace(/[^a-z0-9]/g, '_')}.json`;
+                  link.click();
+                  URL.revokeObjectURL(url);
+                }}
+                className="inline-flex items-center gap-2 px-8 py-3.5 rounded-xl border-3 border-slate-950 bg-amber-400 hover:bg-amber-300 active:scale-95 text-slate-950 font-bangers text-xl tracking-wider uppercase comic-shadow transition-all cursor-pointer"
+              >
+                <span>⬇️ Download Comic Story JSON</span>
+              </button>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* Revision Modal */}
+      <PanelRevisionModal
+        isOpen={revisionModalOpen}
+        onClose={() => setRevisionModalOpen(false)}
+        panel={comic?.panels[selectedPanelIndex] || null}
+        panelIndex={selectedPanelIndex}
+        onRevise={handleRevisePanel}
+        isRevising={isRevising}
+      />
+    </div>
+  );
+}
